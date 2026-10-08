@@ -13,6 +13,8 @@ from .api import Api, ApiError, Retryable
 
 ACTION_PREVIOUS_MENU = 10
 ACTION_NAV_BACK = 92
+ACTION_SELECT_ITEM = 7
+ACTION_MOUSE_LEFT_CLICK = 100
 
 TEXT = 'FFFFFFFF'
 MUTED = 'FFA0A0AA'
@@ -63,12 +65,28 @@ class PairingDialog(xbmcgui.WindowDialog):
     def set_hint(self, text):
         self.countdown.setLabel(text)
 
+    def _is_cancel(self, control_id):
+        try:
+            return control_id == self.cancel.getId()
+        except RuntimeError:
+            return False
+
     def onAction(self, action):
-        if action.getId() in (ACTION_PREVIOUS_MENU, ACTION_NAV_BACK):
+        aid = action.getId()
+        if aid in (ACTION_PREVIOUS_MENU, ACTION_NAV_BACK):
             self.close_dialog()
+        elif aid in (ACTION_SELECT_ITEM, ACTION_MOUSE_LEFT_CLICK):
+            # Kodi meldet den Klick nicht immer per onControl (Fernbedienung, Touch)
+            try:
+                focused = self.getFocusId()
+            except RuntimeError:
+                focused = 0
+            if self._is_cancel(focused):
+                self.close_dialog()
 
     def onControl(self, control):
-        if control == self.cancel:
+        # Vergleich ueber die ID: Kodi reicht nicht unbedingt dasselbe Objekt weiter
+        if control is not None and self._is_cancel(control.getId()):
             self.close_dialog()
 
     def close_dialog(self):

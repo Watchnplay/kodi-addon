@@ -891,7 +891,7 @@ class MetadataTests(unittest.TestCase):
     def test_disclaimer_and_version(self):
         import xml.etree.ElementTree as ET
         root = ET.parse(os.path.join(ADDON_DIR, 'addon.xml')).getroot()
-        self.assertEqual(root.get('version'), '0.1.2')
+        self.assertEqual(root.get('version'), '0.1.3')
         meta = root.find("./extension[@point='xbmc.addon.metadata']")
         disclaimers = dict((d.get('lang'), d.text) for d in meta.findall('disclaimer'))
         self.assertEqual(len(disclaimers), 12)
@@ -900,7 +900,7 @@ class MetadataTests(unittest.TestCase):
         for word in ('may require', 'kann WatchNPlay', 'peut', 'puede', 'può', 'kan WatchNPlay',
                      'może', 'pode', 'kan kräva', 'kan kreve', 'kan kræve'):
             self.assertFalse(any(word in t for t in disclaimers.values()), word)
-        self.assertIn('v0.1.2', meta.find('news').text)
+        self.assertIn('v0.1.3', meta.find('news').text)
 
     def test_swedish_uses_koppla(self):
         path = os.path.join(ADDON_DIR, 'resources', 'language', 'resource.language.sv_se', 'strings.po')
