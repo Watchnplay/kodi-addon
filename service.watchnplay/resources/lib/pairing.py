@@ -98,6 +98,16 @@ def _start(api):
     return api.pair_start(util.device_name(), util.platform(), util.kodi_version(), util.addon_version())
 
 
+def _discard(token):
+    """Bestaetigung kam nach dem Abbrechen an: Geraet beim Server gleich wieder abmelden,
+    damit in der App kein verwaistes Geraet stehen bleibt."""
+    util.log('pairing confirmed after cancel, device removed again')
+    try:
+        Api(util.api_base(), util.user_agent(), token).unpair()
+    except ApiError as exc:
+        util.warn('unpair after cancel failed: %s' % exc.status)
+
+
 def _error_dialog(exc):
     msg = util.lang(32016) if getattr(exc, 'status', 0) == 429 else util.lang(32017)
     xbmcgui.Dialog().ok('WatchNPlay', msg)
@@ -142,6 +152,11 @@ def run(store):
                     poll = {}
                 status = poll.get('status')
                 if status == 'confirmed' and poll.get('token'):
+                    # Abbrechen waehrend der Anfrage: Kodi liefert den Klick erst beim
+                    # naechsten Warten aus, also kurz warten und dann pruefen
+                    if monitor.waitForAbort(0.1) or dlg.closed:
+                        _discard(poll['token'])
+                        break
                     result = poll
                     break
                 if status == 'expired':
@@ -170,6 +185,8 @@ def run(store):
     if not result:
         return False
     user = result.get('userName') or ''
+    # Warteschlange eines frueher gekoppelten Kontos nicht unter dem neuen senden
+    store.clear_queue()
     store.set_auth(result['token'], user, bool(result.get('backSync')))
     util.set_status(True, user, None)
     util.notify(util.lang(32014) % user)

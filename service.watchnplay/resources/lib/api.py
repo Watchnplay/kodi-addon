@@ -17,6 +17,8 @@ class ApiError(Exception):
         Exception.__init__(self, 'HTTP %s' % status)
         self.status = status
         self.body = body or {}
+        # Token der Anfrage (None = ohne Anmeldung oder nicht bekannt)
+        self.token = None
 
 
 class Unauthorized(ApiError):
@@ -81,7 +83,11 @@ class Api(object):
                 parsed = json.loads(err.read().decode('utf-8') or '{}')
             except Exception:
                 parsed = {}
-            raise classify(err.code, parsed if isinstance(parsed, dict) else {})
+            exc = classify(err.code, parsed if isinstance(parsed, dict) else {})
+            # mit welchem Token die Anfrage lief: ein 401 fuer ein altes Token betrifft
+            # keine inzwischen neue Kopplung (sync._handle)
+            exc.token = self.token if auth else None
+            raise exc
         except (URLError, socket.timeout, OSError) as err:
             raise Retryable(0, {'error': str(err)})
         if status == 204 or not raw:

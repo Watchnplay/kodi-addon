@@ -885,13 +885,250 @@ class KodiDisabledTests(unittest.TestCase):
         self.assertTrue(eng.paired)
 
 
+def movies(n, watched=False):
+    return [{'kid': 'movie:%d' % i, 'type': 'movie', 'title': 'T', 'ids': {}, 'watched': watched}
+            for i in range(1, n + 1)]
+
+
+class ReviewTests(unittest.TestCase):
+    """Befunde aus dem Review von xbmc/repo-scripts#2904 (08.10.2026)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def lib_calls(self, api):
+        return [c for c in api.calls if isinstance(c, tuple)]
+
+    # 1: Korrektur des Nutzers direkt nach unserer Markierung geht nicht verloren
+    def test_guard_only_swallows_our_own_state(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(1))
+        api.library_res = {'mark': ['movie:1'], 'unmark': []}
+        eng.tick()
+        self.assertFalse(eng.on_library_update('movie:1', 1))   # unser eigenes Markieren
+        self.assertTrue(eng.on_library_update('movie:1', 0))    # Nutzer nimmt es zurueck
+        self.assertIn('movie:1', st.deltas)
+
+    # 2: endgueltig abgelehntes Haeppchen verwirft nicht die folgenden
+    def test_rejected_chunk_does_not_drop_the_rest(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(1201))
+        st.add_delta('movie:700', clock.t - 100)   # liegt im abgelehnten 2. Haeppchen
+        st.add_delta('movie:1100', clock.t - 100)  # liegt im 3. Haeppchen
+        api.raise_at['library'] = (2, sync.ApiError(400))
+        eng.tick()
+        # 2. Haeppchen abgelehnt (der Fake zaehlt es nur in counts), 3. trotzdem gesendet,
+        # danach die Aenderung aus dem abgelehnten Haeppchen einzeln
+        self.assertEqual(api.counts['library'], 4)
+        self.assertEqual(self.lib_calls(api),
+                         [('library', 500, True), ('library', 201, True), ('library', 1, False)])
+        self.assertFalse(eng.full_pending)
+        self.assertEqual(st.deltas, {})
+
+    def test_rejected_delta_chunk_keeps_later_ones_on_retryable(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(1001))
+        eng.tick()
+        api.calls[:] = []
+        for i in range(1, 1002):
+            st.add_delta('movie:%d' % i, clock.t)
+        clock.t += sync.DEBOUNCE
+        api.raise_at['library'] = (api.counts['library'] + 2, Retryable(503))
+        eng.tick()
+        # 1. Haeppchen gesendet und aus der Warteschlange, 2. scheitert vorlaeufig: 501 bleiben
+        self.assertEqual(len(st.deltas), 501)
+        self.assertEqual(len(store_mod.Store(self.tmp).deltas), 501)
+
+    # 3: Fortsetzen nur, wenn es dieselben Eintraege sind, nicht nur dieselbe Anzahl
+    def test_same_count_other_items_restarts_pass(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(1201))
+        api.raise_at['library'] = (2, Retryable(429))
+        eng.tick()
+        items = movies(1201)
+        items[0] = {'kid': 'movie:9999', 'type': 'movie', 'title': 'Neu', 'ids': {}, 'watched': True}
+        lib.items = items
+        clock.t = eng.next_retry
+        api.calls[:] = []
+        eng.last_status = clock.t
+        eng.tick()
+        self.assertEqual(self.lib_calls(api),
+                         [('library', 500, True), ('library', 500, True), ('library', 201, True)])
+
+    # 4: Position wird unabhaengig vom Abgleich gemessen
+    def test_sampler_updates_position_on_its_own(self):
+        from resources.lib import service as service_mod
+        calls = []
+
+        class Fake(object):
+            tracker = types.SimpleNamespace(update=lambda: calls.append(1))
+            waits = 0
+
+            def abortRequested(self):
+                return False
+
+            def waitForAbort(self, t):
+                self.waits += 1
+                return self.waits >= 3
+
+        service_mod.Service._sample(Fake())
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(service_mod.SAMPLE_EVERY, 1)
+
+    # 5: 401 fuer ein altes Token loescht keine neue Kopplung
+    def test_stale_401_keeps_new_pairing(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp)
+        exc = Unauthorized(401)
+        exc.token = 'old-token'
+        api.raise_on['status'] = exc
+        eng.tick()
+        self.assertEqual(st.token, 'secret-token')
+        self.assertEqual(ui.notes, [])
+        exc.token = 'secret-token'
+        eng.last_status = 0
+        eng.next_retry = 0
+        eng.tick()
+        self.assertIsNone(st.token)
+
+    def test_api_marks_401_with_request_token(self):
+        from urllib.error import HTTPError
+        import io
+
+        def opener(req, timeout=None):
+            raise HTTPError(req.full_url, 401, 'x', {}, io.BytesIO(b'{}'))
+
+        try:
+            Api('https://x/api/kodi', 'UA', 'tok-1', opener=opener).status()
+        except Unauthorized as exc:
+            self.assertEqual(exc.token, 'tok-1')
+        else:
+            self.fail('no 401')
+
+    # 6: Trennen leert die Warteschlange auch ohne laufenden Dienst; Kopplung startet leer
+    def test_pairing_drops_queue_of_previous_account(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp)
+        st.add_play({'type': 'movie', 'title': 'A', 'ids': {}, 'watchedAt': 1, 'percent': 95})
+        st.add_delta('movie:1', 1)
+        st.set_auth('other-account', 'Bob', False)
+        eng.on_paired()
+        self.assertEqual(st.plays, [])
+        self.assertEqual(st.deltas, {})
+        self.assertEqual(store_mod.Store(self.tmp).plays, [])
+
+    def test_disconnect_clears_queue_file(self):
+        from resources.lib import script
+        st = store_mod.Store(self.tmp)
+        st.set_auth('tok', 'Jens', True)
+        st.add_play({'type': 'movie', 'title': 'A', 'ids': {}, 'watchedAt': 1, 'percent': 95})
+        orig = script.Api
+
+        class NoNet(object):
+            def __init__(self, *a, **k):
+                pass
+
+            def unpair(self):
+                return {}
+
+        script.Api = NoNet
+        try:
+            script.disconnect(st, confirm=False)
+        finally:
+            script.Api = orig
+        fresh = store_mod.Store(self.tmp)
+        self.assertIsNone(fresh.token)
+        self.assertEqual(fresh.plays, [])
+
+    # 7: fehlgeschlagenes Schreiben in Kodi wird nach einer Minute wiederholt
+    def test_failed_write_is_retried(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(1))
+        results = [False, True]
+        lib.set_watched = lambda kid, w, lp: lib.set_calls.append((kid, w)) or results.pop(0)
+        api.library_res = {'mark': ['movie:1'], 'unmark': []}
+        eng.tick()
+        self.assertIn('movie:1', eng.write_retry)
+        eng.tick()
+        self.assertEqual(len(lib.set_calls), 1)  # noch nicht faellig
+        clock.t += sync.WRITE_RETRY
+        eng.tick()
+        self.assertEqual(lib.set_calls, [('movie:1', True), ('movie:1', True)])
+        self.assertNotIn('movie:1', eng.write_retry)
+
+    def test_failed_write_gives_up_after_limit(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(1))
+        lib.set_watched = lambda kid, w, lp: lib.set_calls.append(kid) or False
+        api.library_res = {'mark': ['movie:1'], 'unmark': []}
+        eng.tick()
+        for _ in range(sync.WRITE_TRIES + 2):
+            clock.t += sync.WRITE_RETRY
+            eng.tick()
+        self.assertEqual(len(lib.set_calls), sync.WRITE_TRIES)
+        self.assertEqual(eng.write_retry, {})
+
+    # 8: Abbrechen waehrend der Abfrage koppelt nicht und meldet das Geraet wieder ab
+    def test_cancel_during_poll_does_not_pair(self):
+        from resources.lib import pairing
+        st = store_mod.Store(self.tmp)
+        unpaired = []
+        holder = {}
+
+        class Dlg(object):
+            def __init__(self):
+                self.closed = False
+                holder['dlg'] = self
+
+            def set_code(self, res):
+                pass
+
+            def set_countdown(self, s):
+                pass
+
+            def set_hint(self, t):
+                pass
+
+            def show(self):
+                pass
+
+            def close_dialog(self):
+                self.closed = True
+
+        class PairApi(object):
+            def __init__(self, base, ua, token=None):
+                self.token = token
+
+            def pair_start(self, *a):
+                return {'code': 'ABC123', 'pollToken': 'p', 'expiresIn': 600, 'interval': 2}
+
+            def pair_poll(self, token):
+                holder['dlg'].closed = True  # Nutzer bricht ab, waehrend die Anfrage laeuft
+                return {'status': 'confirmed', 'token': 'new-token', 'userName': 'Jens'}
+
+            def unpair(self):
+                unpaired.append(self.token)
+                return {}
+
+        class FakeTime(object):
+            t = 1000.0
+
+            def time(self):
+                FakeTime.t += 1
+                return FakeTime.t
+
+        saved = (pairing.PairingDialog, pairing.Api, pairing.time)
+        pairing.PairingDialog, pairing.Api, pairing.time = Dlg, PairApi, FakeTime()
+        try:
+            self.assertFalse(pairing.run(st))
+        finally:
+            pairing.PairingDialog, pairing.Api, pairing.time = saved
+        self.assertIsNone(st.token)
+        self.assertEqual(unpaired, ['new-token'])
+
+
 class MetadataTests(unittest.TestCase):
     """Fix 9/10: Pro immer noetig, schwedisch einheitlich 'Koppla', keine Gedankenstriche."""
 
     def test_disclaimer_and_version(self):
         import xml.etree.ElementTree as ET
         root = ET.parse(os.path.join(ADDON_DIR, 'addon.xml')).getroot()
-        self.assertEqual(root.get('version'), '0.1.3')
+        self.assertEqual(root.get('version'), '0.1.4')
         meta = root.find("./extension[@point='xbmc.addon.metadata']")
         disclaimers = dict((d.get('lang'), d.text) for d in meta.findall('disclaimer'))
         self.assertEqual(len(disclaimers), 12)
@@ -900,7 +1137,7 @@ class MetadataTests(unittest.TestCase):
         for word in ('may require', 'kann WatchNPlay', 'peut', 'puede', 'può', 'kan WatchNPlay',
                      'może', 'pode', 'kan kräva', 'kan kreve', 'kan kræve'):
             self.assertFalse(any(word in t for t in disclaimers.values()), word)
-        self.assertIn('v0.1.3', meta.find('news').text)
+        self.assertIn('v0.1.4', meta.find('news').text)
 
     def test_swedish_uses_koppla(self):
         path = os.path.join(ADDON_DIR, 'resources', 'language', 'resource.language.sv_se', 'strings.po')

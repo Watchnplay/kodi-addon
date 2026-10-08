@@ -6,10 +6,14 @@ Ohne direkten Kodi-Bezug, damit sie offline testbar ist: Bibliothek, API und
 Oberflaeche kommen als Objekte herein.
 """
 
+import hashlib
 import time
 
 from . import library
 from .api import ApiError, ProRequired, Retryable, Unauthorized
+
+# Fehler, nach denen derselbe Stapel spaeter wieder gesendet wird
+KEEP_ERRORS = (Retryable, Unauthorized, ProRequired)
 
 STATUS_EVERY = 5 * 60
 FULL_EVERY = 6 * 3600
@@ -20,6 +24,9 @@ BACKOFF = (30, 120, 600, 1800)
 PLAYS_PER_REQUEST = 100
 # Server: 120 Anfragen/min je Konto, geteilt von allen Geraeten
 CHUNK_PAUSE = 1.0
+# Rueck-Sync: fehlgeschlagenes Schreiben in Kodi erneut versuchen
+WRITE_RETRY = 60
+WRITE_TRIES = 5
 
 
 def _sleep(seconds):
@@ -44,7 +51,10 @@ class SyncEngine(object):
         self.clock = clock
         self.wait = wait or _sleep
         self.min_percent = min_percent
+        # kid -> (Ablauf, von uns gesetzter Gesehen-Stand)
         self.guard = {}
+        # kid -> {'watched', 'lp', 'tries', 'at'}: Rueck-Sync-Schreiben, das Kodi abgelehnt hat
+        self.write_retry = {}
         self.fails = 0
         self.next_retry = 0
         self.full_pending = True
@@ -72,9 +82,14 @@ class SyncEngine(object):
                        st.get('deviceName'), self.pro_paused)
 
     def on_paired(self):
-        """Nach Kopplung: Zustand frisch, sofort voller Abgleich."""
+        """Nach Kopplung: Zustand frisch, sofort voller Abgleich.
+
+        Die Warteschlange gehoert zum vorigen Konto und wird nicht unter dem neuen gesendet."""
         self.store.reload_auth(force=True)
         self.store.reset_state()
+        self.store.clear_queue()
+        self.guard.clear()
+        self.write_retry.clear()
         self.notified_401 = False
         self.request_full(now=True)
         self.last_status = 0
@@ -84,6 +99,7 @@ class SyncEngine(object):
         self.store.reset_state()
         self.store.clear_queue()
         self.guard.clear()
+        self.write_retry.clear()
         self.refresh_ui()
 
     def request_full(self, now=False):
@@ -100,19 +116,27 @@ class SyncEngine(object):
             self.store.save_state()
 
     # --- Schleifenschutz ---
-    def guard_kid(self, kid):
-        self.guard[kid] = self.clock() + GUARD_TTL
+    def guard_kid(self, kid, watched):
+        self.guard[kid] = (self.clock() + GUARD_TTL, bool(watched))
 
-    def is_guarded(self, kid):
+    def is_guarded(self, kid, watched=None):
+        """True, wenn die Meldung unsere eigene Aenderung ist.
+
+        Mit bekanntem Stand nur, wenn er dem von uns gesetzten entspricht: korrigiert der
+        Nutzer unsere Markierung gleich danach, geht die Korrektur normal durch."""
         now = self.clock()
-        for k in [k for k, exp in self.guard.items() if exp <= now]:
+        for k in [k for k, (exp, _) in self.guard.items() if exp <= now]:
             del self.guard[k]
-        return kid in self.guard
+        entry = self.guard.get(kid)
+        if entry is None:
+            return False
+        return watched is None or entry[1] == bool(watched)
 
     # --- Eingaenge ---
-    def on_library_update(self, kid):
+    def on_library_update(self, kid, playcount=None):
         """Kodi hat playcount geaendert. Eigene Markierungen nicht zurueckmelden."""
-        if not self.paired or self.is_guarded(kid):
+        watched = None if playcount is None else playcount > 0
+        if not self.paired or self.is_guarded(kid, watched):
             return False
         self.store.add_delta(kid, self.clock())
         return True
@@ -136,11 +160,17 @@ class SyncEngine(object):
 
     def _handle(self, exc):
         if isinstance(exc, Unauthorized):
+            used = getattr(exc, 'token', None)
+            if used is not None and used != self.store.token:
+                # Anfrage lief noch mit dem alten Token, inzwischen neu gekoppelt: nichts loeschen
+                self.ui.log('401 for a previous token, current connection kept')
+                return
             self.ui.warn('token rejected (401), connection removed')
             self.store.clear_auth()
             self.store.reset_state()
             self.store.clear_queue()
             self.guard.clear()
+            self.write_retry.clear()
             if not self.notified_401:
                 self.notified_401 = True
                 self.ui.notify(32018)
@@ -185,6 +215,7 @@ class SyncEngine(object):
         if not self.paired:
             return
         now = self.clock()
+        self.retry_writes()
         st = self.store.state
         if self.pro_paused:
             # Waehrend der Pause nur alle 6 h /status; Wiedergaben werden weiter gesammelt
@@ -246,19 +277,51 @@ class SyncEngine(object):
                     if item is None:
                         continue
                 if bool(item.get('watched')) == watched:
+                    self.write_retry.pop(kid, None)
                     continue
-                self.guard_kid(kid)
-                if self.lib.set_watched(kid, watched, bool(item.get('lastPlayed'))):
+                if self._write(kid, watched, bool(item.get('lastPlayed'))):
                     item['watched'] = watched
                     changed += 1
         return changed
+
+    def _write(self, kid, watched, has_lastplayed):
+        """In Kodi markieren; schlaegt es fehl, spaeter erneut (nicht erst beim naechsten vollen Abgleich)."""
+        self.guard_kid(kid, watched)
+        if self.lib.set_watched(kid, watched, has_lastplayed):
+            self.write_retry.pop(kid, None)
+            return True
+        entry = self.write_retry.get(kid)
+        if entry is None or entry['watched'] != watched:
+            entry = {'watched': watched, 'lp': has_lastplayed, 'tries': 0}
+        entry['tries'] += 1
+        if entry['tries'] >= WRITE_TRIES:
+            self.ui.warn('could not update %s in Kodi after %d tries' % (kid, entry['tries']))
+            self.write_retry.pop(kid, None)
+            return False
+        entry['at'] = self.clock() + WRITE_RETRY
+        self.write_retry[kid] = entry
+        return False
+
+    def retry_writes(self):
+        now = self.clock()
+        for kid, entry in list(self.write_retry.items()):
+            if now < entry['at']:
+                continue
+            current = self.lib.get_item(kid)
+            if current is None or bool(current.get('watched')) == entry['watched']:
+                # Titel weg oder inzwischen schon im gewuenschten Stand
+                self.write_retry.pop(kid, None)
+                continue
+            self._write(kid, entry['watched'], entry['lp'])
 
     def full_reconcile(self):
         """Ganze Bibliothek in Haeppchen senden, mit Pause dazwischen.
 
         Der laufende Durchgang (state['fullPass']) merkt sich das naechste Haeppchen; nach
         429/Netzfehler/Neustart geht es dort weiter statt wieder bei 1. Neu beginnt er, wenn
-        sich die Anzahl der Eintraege geaendert hat.
+        sich die Eintraege geaendert haben (Fingerabdruck aller Ids in Reihenfolge, nicht nur
+        die Anzahl: sonst rutscht ein neuer Titel in ein schon gesendetes Haeppchen).
+        Lehnt der Server ein Haeppchen endgueltig ab, faellt nur dieses weg.
         """
         now = self.clock()
         try:
@@ -269,15 +332,18 @@ class SyncEngine(object):
             return False
         self.library_index = library.build_index(items)
         st = self.store.state
+        sig = hashlib.sha1('\n'.join(i['kid'] for i in items).encode('utf-8')).hexdigest()
         fpass = st.get('fullPass')
-        if not isinstance(fpass, dict) or fpass.get('count') != len(items):
-            fpass = {'count': len(items), 'next': 0, 'started': now}
+        if not isinstance(fpass, dict) or fpass.get('sig') != sig:
+            fpass = {'sig': sig, 'next': 0, 'started': now}
         started = fpass.get('started', now)
         chunks = list(self.lib.chunks(items))
         start = min(max(0, int(fpass.get('next') or 0)), len(chunks))
         if start:
             self.ui.log('full reconcile resumes at part %d of %d' % (start + 1, len(chunks)))
         applied = 0
+        dropped = 0
+        rejected = set()
         try:
             api = self._api()
             known = dict((i['kid'], i) for i in items)
@@ -286,21 +352,29 @@ class SyncEngine(object):
                 if idx > start and self.wait(CHUNK_PAUSE):
                     self._save_pass(fpass, idx)
                     return False
-                res = api.library(chunks[idx], True)
-                applied += self._apply(res, known)
+                try:
+                    part = api.library(chunks[idx], True)
+                except ApiError as exc:
+                    if isinstance(exc, KEEP_ERRORS):
+                        raise
+                    self._handle(exc)
+                    dropped += 1
+                    rejected.update(i['kid'] for i in chunks[idx])
+                else:
+                    res = part
+                    applied += self._apply(part, known)
                 self._save_pass(fpass, idx + 1)
             if not chunks:
                 res = api.library([], True)
         except ApiError as exc:
             self._handle(exc)
-            if not isinstance(exc, (Retryable, Unauthorized, ProRequired)):
-                self._finish_full(started)
             return False
         self._ok()
-        if res is not None:
+        if res is not None and not dropped:
             self._adopt_version(res)
-        self._finish_full(started)
-        self.ui.log('full reconcile: %d items, %d changed in Kodi' % (len(items), applied))
+        self._finish_full(started, keep=rejected)
+        self.ui.log('full reconcile: %d items, %d changed in Kodi, %d parts rejected'
+                    % (len(items), applied, dropped))
         return True
 
     def _save_pass(self, fpass, next_idx):
@@ -308,14 +382,15 @@ class SyncEngine(object):
         self.store.state['fullPass'] = fpass
         self.store.save_state()
 
-    def _finish_full(self, started):
+    def _finish_full(self, started, keep=()):
         self.full_pending = False
         self.store.state.pop('fullPass', None)
         self.store.state['lastFull'] = started
         self.store.save_state()
-        # Einzel-Aenderungen vor dem Beginn des Durchgangs sind darin enthalten
+        # Einzel-Aenderungen vor dem Beginn des Durchgangs sind darin enthalten (ausser im
+        # abgelehnten Haeppchen: die gehen weiter einzeln)
         for kid, ts in list(self.store.deltas.items()):
-            if ts <= started:
+            if ts <= started and kid not in keep:
                 del self.store.deltas[kid]
         self.store.save_queue()
 
@@ -324,32 +399,47 @@ class SyncEngine(object):
         due = [(k, ts) for k, ts in self.store.deltas.items() if now - ts >= DEBOUNCE]
         if not due:
             return True
+        stamps = dict(due)
         items = []
-        for kid, _ in due:
+        for kid, ts in due:
             item = self.lib.get_item(kid)
             if item:
                 items.append(item)
-        try:
-            api = self._api()
-            res = None
-            for idx, chunk in enumerate(self.lib.chunks(items)):
-                if idx and self.wait(CHUNK_PAUSE):
-                    return False
-                res = api.library(chunk, False)
-                self._apply(res, dict((i['kid'], i) for i in chunk))
-        except ApiError as exc:
-            self._handle(exc)
-            if isinstance(exc, (Retryable, Unauthorized, ProRequired)):
+            else:
+                # nicht mehr in Kodis Bibliothek
+                self._drop_deltas([kid], stamps)
+        api = self._api()
+        res = None
+        dropped = 0
+        for idx, chunk in enumerate(self.lib.chunks(items)):
+            if idx and self.wait(CHUNK_PAUSE):
+                self.store.save_queue()
                 return False
-        else:
-            self._ok()
-            if res is not None:
-                self._adopt_version(res)
-        for kid, ts in due:
-            if self.store.deltas.get(kid) == ts:
-                del self.store.deltas[kid]
+            try:
+                part = api.library(chunk, False)
+            except ApiError as exc:
+                self._handle(exc)
+                if isinstance(exc, KEEP_ERRORS):
+                    # dieses und alle folgenden Haeppchen bleiben in der Warteschlange
+                    self.store.save_queue()
+                    return False
+                dropped += 1
+            else:
+                res = part
+                self._apply(part, dict((i['kid'], i) for i in chunk))
+            # gesendet oder endgueltig abgelehnt: nur dieses Haeppchen aus der Warteschlange
+            self._drop_deltas([i['kid'] for i in chunk], stamps)
+        self._ok()
+        if res is not None and not dropped:
+            self._adopt_version(res)
         self.store.save_queue()
         return True
+
+    def _drop_deltas(self, kids, stamps):
+        """Nur entfernen, wenn seit dem Lesen keine neuere Aenderung dazukam."""
+        for kid in kids:
+            if self.store.deltas.get(kid) == stamps.get(kid):
+                del self.store.deltas[kid]
 
     def flush_plays(self):
         if not self.store.plays:

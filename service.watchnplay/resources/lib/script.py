@@ -25,6 +25,10 @@ def disconnect(store, confirm=True):
             # lokal trotzdem trennen; das Geraet laesst sich in der App entfernen
             util.warn('unpair failed: %s' % exc.status)
     store.clear_auth()
+    # Warteschlange gehoert zu diesem Konto: auch dann leeren, wenn der Dienst gerade
+    # nicht laeuft, sonst ginge sie nach der naechsten Kopplung an ein anderes Konto
+    store.clear_queue()
+    store.reset_state()
     util.set_status(False)
     util.notify_service('unpaired')
     util.notify(util.lang(32020))

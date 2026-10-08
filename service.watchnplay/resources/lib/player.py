@@ -9,6 +9,7 @@ aus dem Dateimanager, Trailer und Videoplattformen werden nicht gemeldet.
 """
 
 import re
+import threading
 
 import xbmc
 
@@ -145,15 +146,18 @@ class Tracker(xbmc.Player):
         self.playing_file = None
         self.position = 0.0
         self.total = 0.0
+        # update() laeuft im Mess-Thread des Dienstes, die Player-Callbacks im Dienst-Thread
+        self.lock = threading.RLock()
 
     def onAVStarted(self):
         # Wiedergabeliste: der Wechsel zum naechsten Eintrag meldet kein Ende fuer den vorigen
         if self.current is not None:
             self._finish()
-        self.current = None
-        self.playing_file = None
-        self.position = 0.0
-        self.total = 0.0
+        with self.lock:
+            self.current = None
+            self.playing_file = None
+            self.position = 0.0
+            self.total = 0.0
         try:
             if not self.isPlayingVideo():
                 return
@@ -168,8 +172,9 @@ class Tracker(xbmc.Player):
         if not ok:
             util.log('playback not tracked: %s' % why)
             return
-        self.current = info
-        self.playing_file = self._playing_file()
+        with self.lock:
+            self.current = info
+            self.playing_file = self._playing_file()
         self.update()
 
     def _read_item(self):
@@ -230,32 +235,35 @@ class Tracker(xbmc.Player):
 
         Zaehlt wie Kodi die letzte Position, nicht die weiteste: wer ans Ende springt und
         zurueckspult, hat den Titel nicht gesehen."""
-        if self.current is None:
-            return
-        try:
-            if self.isPlayingVideo():
-                # Wiedergabeliste: zwischen Ende und naechstem onAVStarted laeuft schon der Folgetitel
-                if self.playing_file and self._playing_file() != self.playing_file:
-                    return
-                pos = self.getTime()
-                tot = self.getTotalTime()
-                if tot > 0:
-                    self.total = tot
-                    self.position = max(0.0, pos)
-        except Exception:
-            pass
+        with self.lock:
+            if self.current is None:
+                return
+            try:
+                if self.isPlayingVideo():
+                    # Wiedergabeliste: zwischen Ende und naechstem onAVStarted laeuft schon der Folgetitel
+                    if self.playing_file and self._playing_file() != self.playing_file:
+                        return
+                    pos = self.getTime()
+                    tot = self.getTotalTime()
+                    if tot > 0:
+                        self.total = tot
+                        self.position = max(0.0, pos)
+            except Exception:
+                pass
 
     def _finish(self):
         """Prozent immer aus der zuletzt mitgeschriebenen Position, nie pauschal 100 %:
         HTTP-/inputstream-Quellen melden 'ended' bei jedem vorzeitigen Dateiende."""
-        info, self.current = self.current, None
+        with self.lock:
+            info, self.current = self.current, None
+            position, total = self.position, self.total
         if info is None:
             return
-        ok, why = should_report(info, self.total)
+        ok, why = should_report(info, total)
         if not ok:
             util.log('streaming playback not reported: %s' % why)
             return
-        pct = percent(self.position, self.total)
+        pct = percent(position, total)
         threshold = util.watched_threshold()
         if not reached(pct, threshold):
             util.log('streaming playback stopped at %.0f%% (< %.0f%%), not reported' % (pct, threshold))

@@ -3,6 +3,7 @@
 """WatchNPlay-Dienst: laeuft ab Kodi-Start im Hintergrund."""
 
 import json
+import threading
 
 import xbmc
 
@@ -12,7 +13,8 @@ from resources.lib.store import Store
 from resources.lib.sync import SyncEngine
 
 STARTUP_DELAY = 30
-TRACK_EVERY = 5
+# Wiedergabeposition: eigener Takt, unabhaengig von laufenden Anfragen
+SAMPLE_EVERY = 1
 
 
 class Ui(object):
@@ -46,13 +48,21 @@ class Service(xbmc.Monitor):
         self.tracker = player.Tracker(self.engine.queue_play)
 
     def _wait(self, seconds):
-        """Pause zwischen Abgleich-Haeppchen: Position der Wiedergabe weiter mitschreiben."""
-        if self.tracker is not None:
+        """Pause zwischen Abgleich-Haeppchen."""
+        return self.waitForAbort(seconds)
+
+    def _sample(self):
+        """Position der Wiedergabe jede Sekunde mitschreiben, auch waehrend eine Anfrage haengt.
+
+        Nach dem Stopp ist sie nicht mehr lesbar, und Kodi ruft onPlayBackStopped erst auf,
+        wenn der Dienst-Thread wieder wartet."""
+        while not self.abortRequested():
             try:
                 self.tracker.update()
-            except Exception:
-                pass
-        return self.waitForAbort(seconds)
+            except Exception as exc:
+                util.warn('position sampling failed: %s' % exc)
+            if self.waitForAbort(SAMPLE_EVERY):
+                break
 
     def onNotification(self, sender, method, data):
         try:
@@ -64,7 +74,8 @@ class Service(xbmc.Monitor):
                     return
                 item = payload.get('item') or {}
                 if item.get('type') in ('movie', 'episode') and (item.get('id') or 0) > 0:
-                    self.engine.on_library_update('%s:%d' % (item['type'], item['id']))
+                    self.engine.on_library_update('%s:%d' % (item['type'], item['id']),
+                                                  payload.get('playcount'))
             elif sender == util.ADDON_ID:
                 if method == 'Other.paired':
                     self.engine.on_paired()
@@ -77,18 +88,17 @@ class Service(xbmc.Monitor):
 
     def run(self):
         util.log('service started')
-        if self.waitForAbort(STARTUP_DELAY):
-            return
-        self.engine.refresh_ui()
-        ticks = 0
-        while not self.abortRequested():
-            try:
-                if ticks % TRACK_EVERY == 0:
-                    self.tracker.update()
-                self.engine.tick()
-            except Exception as exc:
-                util.warn('sync tick failed: %s' % exc)
-            ticks += 1
-            if self.waitForAbort(1):
-                break
+        sampler = threading.Thread(target=self._sample, name='watchnplay-position')
+        sampler.daemon = True
+        sampler.start()
+        if not self.waitForAbort(STARTUP_DELAY):
+            self.engine.refresh_ui()
+            while not self.abortRequested():
+                try:
+                    self.engine.tick()
+                except Exception as exc:
+                    util.warn('sync tick failed: %s' % exc)
+                if self.waitForAbort(1):
+                    break
+        sampler.join(5)
         util.log('service stopped')
