@@ -2,6 +2,8 @@
 
 Kodi add-on (`service.watchnplay`) that keeps your [WatchNPlay](https://watch-n-play.com) account up to date with what you watch in Kodi.
 
+WatchNPlay is an app for iPhone and Android and a website at [watch-n-play.com](https://watch-n-play.com): track movies, series and games, rate them and see where they are streaming.
+
 Works with Kodi 19 (Matrix) and newer on every platform: Android TV / Google TV, phones and tablets, Windows, macOS, Linux, LibreELEC and CoreELEC. Pure Python 3, no third-party libraries.
 
 ## Features
