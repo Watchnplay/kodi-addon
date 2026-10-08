@@ -290,6 +290,7 @@ class StoreTests(unittest.TestCase):
         s = store_mod.Store(self.tmp)
         s.add_play({'type': 'movie', 'title': 'A', 'ids': {}, 'watchedAt': 1, 'percent': 95})
         s.add_delta('movie:3', 123.0)
+        s.save_if_dirty()  # Deltas werden gesammelt geschrieben
         s.set_auth('tok', 'Jens', False)
         s.state['version'] = 'v9'
         s.save_state()
@@ -632,20 +633,22 @@ class VersionTests(unittest.TestCase):
         eng.tick()
         self.assertEqual(api.calls.count('status'), 1)  # nur der regulaere vorab
         self.assertEqual(st.state['version'], 'v5')
-        # Delta: ebenfalls Version aus der Antwort, kein /status hinterher
+        # Delta: Version NICHT uebernehmen (Review 08.10.2026). v6 kann eine Aenderung in
+        # der App an einem anderen Titel enthalten, die mark/unmark dieser Antwort nicht kennt.
         api.library_res = dict(api.library_res, version='v6')
         clock.t += 1
         eng.on_library_update('movie:1')
         clock.t += sync.DEBOUNCE
         eng.tick()
         self.assertEqual(api.calls.count('status'), 1)
-        self.assertEqual(st.state['version'], 'v6')
-        # Server meldet v6 (unser eigener Stand): kein neuer voller Abgleich
+        self.assertEqual(st.state['version'], 'v5')
+        # /status meldet v6: voller Abgleich holt die App-Aenderung nach Kodi
         api.status_res['version'] = 'v6'
         n_full = sum(1 for c in api.calls if c == ('library', 1, True))
         clock.t += sync.STATUS_EVERY
         eng.tick()
-        self.assertEqual(sum(1 for c in api.calls if c == ('library', 1, True)), n_full)
+        self.assertEqual(sum(1 for c in api.calls if c == ('library', 1, True)), n_full + 1)
+        self.assertEqual(st.state['version'], 'v6')
 
     def test_change_during_flush_is_not_swallowed(self):
         """Server-Stand v5 nach unserem /library, danach in der App geaendert (v7): voller Abgleich."""
@@ -926,18 +929,16 @@ class ReviewTests(unittest.TestCase):
         self.assertFalse(eng.full_pending)
         self.assertEqual(st.deltas, {})
 
-    def test_rejected_delta_chunk_keeps_later_ones_on_retryable(self):
-        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(1001))
+    def test_deltas_kept_on_retryable(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(150))
         eng.tick()
-        api.calls[:] = []
-        for i in range(1, 1002):
+        for i in range(1, 151):
             st.add_delta('movie:%d' % i, clock.t)
         clock.t += sync.DEBOUNCE
-        api.raise_at['library'] = (api.counts['library'] + 2, Retryable(503))
+        api.raise_at['library'] = (api.counts['library'] + 1, Retryable(503))
         eng.tick()
-        # 1. Haeppchen gesendet und aus der Warteschlange, 2. scheitert vorlaeufig: 501 bleiben
-        self.assertEqual(len(st.deltas), 501)
-        self.assertEqual(len(store_mod.Store(self.tmp).deltas), 501)
+        self.assertEqual(len(st.deltas), 150)
+        self.assertEqual(len(store_mod.Store(self.tmp).deltas), 150)
 
     # 3: Fortsetzen nur, wenn es dieselben Eintraege sind, nicht nur dieselbe Anzahl
     def test_same_count_other_items_restarts_pass(self):
@@ -1122,13 +1123,214 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(unpaired, ['new-token'])
 
 
+class SecondReviewTests(unittest.TestCase):
+    """Eigenes Review 08.10.2026 (0.1.5)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def full_calls(self, api):
+        return [c for c in api.calls if isinstance(c, tuple) and c[2]]
+
+    def test_full_request_during_pass_is_kept(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(1201))
+        # Mediathek-Scan endet waehrend der Pause zwischen zwei Haeppchen
+        eng.wait = lambda s: eng.request_full() or False
+        eng.tick()
+        self.assertTrue(eng.full_pending)
+
+    def test_version_of_first_chunk_is_adopted(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(1201))
+        versions = iter(['v1', 'v2', 'v3'])
+        orig = api.library
+
+        def library(items, full):
+            res = orig(items, full)
+            res['version'] = next(versions)
+            return res
+        api.library = library
+        eng.tick()
+        self.assertEqual(st.state['version'], 'v1')
+
+    def test_unexpected_4xx_is_retried_not_dropped(self):
+        from resources.lib import api as api_mod
+        self.assertIsInstance(api_mod.classify(403, {}), Retryable)
+        self.assertIsInstance(api_mod.classify(404, {}), Retryable)
+        self.assertIsInstance(api_mod.classify(400, {}), Retryable)
+        dropped = api_mod.classify(400, {'code': 'KODI_BAD_PLAYS'})
+        self.assertNotIsInstance(dropped, sync.KEEP_ERRORS)
+        eng, st, api, ui, lib, clock = make_engine(self.tmp)
+        eng.tick()
+        st.add_play({'type': 'movie', 'title': 'A', 'ids': {}, 'watchedAt': 1, 'percent': 95})
+        api.raise_on['plays'] = api_mod.classify(403, {})
+        eng.tick()
+        self.assertEqual(len(st.plays), 1)
+
+    def test_read_error_keeps_delta_missing_item_drops_it(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(2))
+        eng.tick()
+
+        def get_item(kid):
+            if kid == 'movie:1':
+                raise library.RpcError('busy', -32100)
+            return None
+        lib.get_item = get_item
+        st.add_delta('movie:1', clock.t)
+        st.add_delta('movie:9', clock.t)
+        clock.t += sync.DEBOUNCE
+        eng.tick()
+        self.assertIn('movie:1', st.deltas)
+        orig = library.rpc
+        library.rpc = lambda *a, **k: (_ for _ in ()).throw(library.RpcError('x', library.RPC_INVALID_PARAMS))
+        try:
+            self.assertIsNone(library.get_item('movie:5'))
+            library.rpc = lambda *a, **k: (_ for _ in ()).throw(library.RpcError('x', -32100))
+            with self.assertRaises(library.RpcError):
+                library.get_item('movie:5')
+        finally:
+            library.rpc = orig
+
+    def test_status_without_pro_keeps_pause(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(1))
+        api.status_res['pro'] = False
+        eng.tick()
+        self.assertTrue(eng.pro_paused)
+        self.assertEqual(self.full_calls(api), [])
+        clock.t += sync.PRO_RETRY
+        eng.tick()
+        self.assertTrue(eng.pro_paused)
+        self.assertEqual(self.full_calls(api), [])
+
+    def test_unpair_during_pass_stops_it(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(1201))
+        def wait(s):
+            st.clear_auth()
+            eng.on_unpaired()
+            return False
+        eng.wait = wait
+        eng.tick()
+        self.assertEqual(len(self.full_calls(api)), 1)
+        # nach dem Trennen kein Haeppchen mehr und kein Durchgangs-Stand im frischen Zustand
+        self.assertNotIn('fullPass', st.state)
+
+    def test_without_backsync_only_watched_items_are_sent(self):
+        items = movies(3) + [{'kid': 'movie:9', 'type': 'movie', 'title': 'S', 'ids': {}, 'watched': True}]
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, items)
+        api.status_res['backSync'] = False
+        api.library_res = {'mark': [], 'unmark': [], 'backSync': False}
+        eng.tick()
+        self.assertEqual(self.full_calls(api), [('library', 1, True)])
+        # Rueck-Sync eingeschaltet: ganze Bibliothek
+        api.status_res['backSync'] = True
+        clock.t += sync.STATUS_EVERY
+        eng.tick()
+        self.assertEqual(self.full_calls(api)[-1], ('library', 4, True))
+
+    def test_backsync_switched_on_seen_in_library_response(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(3))
+        api.status_res['backSync'] = False
+        api.library_res = {'mark': [], 'unmark': [], 'backSync': False}
+        eng.tick()
+        st.add_delta('movie:1', clock.t)
+        api.library_res = {'mark': [], 'unmark': [], 'backSync': True}
+        clock.t += sync.DEBOUNCE
+        eng.tick()
+        self.assertTrue(eng.full_pending)
+        eng.tick()
+        self.assertEqual(self.full_calls(api)[-1], ('library', 3, True))
+
+    def test_mass_changes_trigger_full_instead_of_single_reads(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(300))
+        eng.tick()
+        reads = []
+        lib.get_item = lambda kid: reads.append(kid)
+        for i in range(1, 301):
+            st.add_delta('movie:%d' % i, clock.t)
+        clock.t += sync.DEBOUNCE
+        eng.tick()   # fordert den vollen Abgleich an
+        eng.tick()   # fuehrt ihn aus, er deckt die Aenderungen ab
+        self.assertEqual(reads, [])
+        self.assertEqual(st.deltas, {})
+        self.assertEqual(self.full_calls(api)[-1], ('library', 300, True))
+
+    def test_full_waits_for_playback_unless_sync_now(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(1))
+        eng.is_playing = lambda: True
+        eng.tick()
+        self.assertEqual(self.full_calls(api), [])
+        eng.sync_now()
+        eng.tick()
+        self.assertEqual(len(self.full_calls(api)), 1)
+        self.assertFalse(eng.full_forced)
+
+    def test_settings_written_only_on_change(self):
+        import xbmcaddon
+        writes = []
+        orig = xbmcaddon.Addon.setSetting
+
+        def counting(self_, key, value):
+            writes.append(key)
+            orig(self_, key, value)
+        xbmcaddon.Addon.setSetting = counting
+        try:
+            util.set_status(True, 'Jens', 'TV')
+            first = len(writes)
+            util.set_status(True, 'Jens', 'TV')
+            self.assertEqual(len(writes), first)
+            util.set_status(True, 'Jens', 'Box')
+            self.assertEqual(writes[-1], 'device_label')
+        finally:
+            xbmcaddon.Addon.setSetting = orig
+
+    def test_api_base_requires_https_outside_lan(self):
+        import xbmcaddon
+        for value, expected in (('http://evil.example/api', util.DEFAULT_API_BASE),
+                                ('http://192.168.0.10:3011/api/kodi', 'http://192.168.0.10:3011/api/kodi'),
+                                ('https://staging.example/api/kodi', 'https://staging.example/api/kodi')):
+            xbmcaddon.Addon.settings['api_base'] = value
+            self.assertEqual(util.api_base(), expected)
+        xbmcaddon.Addon.settings['api_base'] = ''
+
+    def test_store_temp_file_is_per_process_and_cleaned(self):
+        st = store_mod.Store(self.tmp)
+        st.add_play({'type': 'movie', 'title': 'A', 'ids': {}, 'watchedAt': 1, 'percent': 95})
+        self.assertEqual([f for f in os.listdir(self.tmp) if f.endswith('.tmp')], [])
+
+    def test_infotag_reads_independently(self):
+        class PartialTag(object):
+            def getUniqueID(self, key):
+                raise AttributeError('old Kodi')
+
+            def getTitle(self):
+                return 'Dune'
+
+            def getMediaType(self):
+                return 'movie'
+
+        t = player.Tracker(lambda p: None)
+        t.getVideoInfoTag = lambda: PartialTag()
+        t._playing_file = lambda: 'plugin://plugin.video.netflix/play/1'
+        orig = library.rpc
+        library.rpc = lambda m, p=None: ([{'type': 'video', 'playerid': 1}] if m == 'Player.GetActivePlayers'
+                                          else {'item': {'file': 'plugin://plugin.video.netflix/play/1'}})
+        try:
+            info = t._read_item()
+        finally:
+            library.rpc = orig
+        self.assertEqual(info['title'], 'Dune')
+        self.assertEqual(info['type'], 'movie')
+
+
 class MetadataTests(unittest.TestCase):
     """Fix 9/10: Pro immer noetig, schwedisch einheitlich 'Koppla', keine Gedankenstriche."""
 
     def test_disclaimer_and_version(self):
         import xml.etree.ElementTree as ET
         root = ET.parse(os.path.join(ADDON_DIR, 'addon.xml')).getroot()
-        self.assertEqual(root.get('version'), '0.1.4')
+        self.assertEqual(root.get('version'), '0.1.5')
         meta = root.find("./extension[@point='xbmc.addon.metadata']")
         disclaimers = dict((d.get('lang'), d.text) for d in meta.findall('disclaimer'))
         self.assertEqual(len(disclaimers), 12)
@@ -1137,7 +1339,7 @@ class MetadataTests(unittest.TestCase):
         for word in ('may require', 'kann WatchNPlay', 'peut', 'puede', 'può', 'kan WatchNPlay',
                      'może', 'pode', 'kan kräva', 'kan kreve', 'kan kræve'):
             self.assertFalse(any(word in t for t in disclaimers.values()), word)
-        self.assertIn('v0.1.4', meta.find('news').text)
+        self.assertIn('v0.1.5', meta.find('news').text)
 
     def test_swedish_uses_koppla(self):
         path = os.path.join(ADDON_DIR, 'resources', 'language', 'resource.language.sv_se', 'strings.po')

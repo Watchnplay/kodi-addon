@@ -25,10 +25,21 @@ def _read(path, default):
 
 
 def _write(path, data):
-    tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
-    os.replace(tmp, path)
+    # Zwischendatei je Prozess: Dienst und Skript schreiben sonst in dieselbe .tmp
+    tmp = '%s.%d.tmp' % (path, os.getpid())
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
+            f.flush()
+            # erst auf der Speicherkarte, dann umbenennen: nach Stromausfall keine leere Datei
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 class Store(object):
@@ -45,6 +56,7 @@ class Store(object):
         q = _read(self._queue_path, {})
         self.plays = q.get('plays') if isinstance(q.get('plays'), list) else []
         self.deltas = q.get('deltas') if isinstance(q.get('deltas'), dict) else {}
+        self._dirty = False
         self.reload_auth(force=True)
 
     # --- auth ---
@@ -94,12 +106,20 @@ class Store(object):
         self.save_queue()
 
     def add_delta(self, kid, ts):
+        """Merkt die Aenderung; geschrieben wird gesammelt (save_if_dirty im naechsten Takt).
+
+        Eine ganze Staffel als gesehen markiert sind sonst hunderte Schreibvorgaenge der
+        wachsenden Datei (schlecht fuer SD-Karten)."""
         self.deltas[kid] = ts
         if len(self.deltas) > MAX_DELTAS:
             oldest = sorted(self.deltas.items(), key=lambda kv: kv[1])[:len(self.deltas) - MAX_DELTAS]
             for k, _ in oldest:
                 self.deltas.pop(k, None)
-        self.save_queue()
+        self._dirty = True
+
+    def save_if_dirty(self):
+        if self._dirty:
+            self.save_queue()
 
     def clear_queue(self):
         self.plays = []
@@ -107,4 +127,5 @@ class Store(object):
         self.save_queue()
 
     def save_queue(self):
+        self._dirty = False
         _write(self._queue_path, {'plays': self.plays, 'deltas': self.deltas})

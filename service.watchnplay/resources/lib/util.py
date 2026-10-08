@@ -43,6 +43,11 @@ def log(msg, level=None):
     xbmc.log('[%s] %s' % (ADDON_ID, msg), level)
 
 
+def debug(msg):
+    """Pro Wiedergabe und Einzelschritt: nur im Debug-Log."""
+    log(msg, xbmc.LOGDEBUG)
+
+
 def warn(msg):
     log(msg, xbmc.LOGWARNING)
 
@@ -61,29 +66,44 @@ def notify_service(message):
     xbmc.executebuiltin('NotifyAll(%s,%s)' % (ADDON_ID, message))
 
 
+# Versteckte Test-Einstellung api_base: unverschluesselt nur ins eigene Netz, das
+# Geraete-Token geht sonst im Klartext ueber das Internet
+_LOCAL_HTTP = re.compile(r'^http://(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)')
+
+
 def api_base():
     try:
         value = (addon().getSetting('api_base') or '').strip()
     except Exception:
         value = ''
+    if value and not (value.startswith('https://') or _LOCAL_HTTP.match(value)):
+        warn('api_base ignored (https required outside the local network)')
+        value = ''
     return (value or DEFAULT_API_BASE).rstrip('/')
 
 
 def set_status(paired, user_name=None, device_name=None, pro_paused=False):
-    """Schreibt Statuszeilen und Sichtbarkeit der Knoepfe in die Einstellungen."""
+    """Schreibt Statuszeilen und Sichtbarkeit der Knoepfe in die Einstellungen.
+
+    Nur bei Aenderung: jeder setSetting-Aufruf speichert settings.xml, und der Dienst
+    meldet den Stand alle 5 Minuten (SD-Karten auf Raspberry Pi / LibreELEC)."""
     a = addon()
-    try:
-        a.setSettingBool('paired', bool(paired))
-    except Exception:
-        a.setSetting('paired', 'true' if paired else 'false')
     if not paired:
         text = lang(32005)
     elif pro_paused:
         text = lang(32008)
     else:
         text = lang(32006) % (user_name or '?')
-    a.setSetting('status_label', text)
-    a.setSetting('device_label', device_name or '')
+    try:
+        if a.getSettingBool('paired') != bool(paired):
+            a.setSettingBool('paired', bool(paired))
+    except Exception:
+        value = 'true' if paired else 'false'
+        if a.getSetting('paired') != value:
+            a.setSetting('paired', value)
+    for key, value in (('status_label', text), ('device_label', device_name or '')):
+        if a.getSetting(key) != value:
+            a.setSetting(key, value)
 
 
 def device_name():

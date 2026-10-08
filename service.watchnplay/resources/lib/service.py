@@ -44,8 +44,12 @@ class Service(xbmc.Monitor):
         self.store = Store(util.profile_dir())
         self.tracker = None
         self.engine = SyncEngine(self.store, library, Ui(), make_api,
-                                 wait=self._wait, min_percent=util.watched_threshold)
+                                 wait=self._wait, min_percent=util.watched_threshold,
+                                 is_playing=self._is_playing)
         self.tracker = player.Tracker(self.engine.queue_play)
+
+    def _is_playing(self):
+        return self.tracker is not None and self.tracker.isPlayingVideo()
 
     def _wait(self, seconds):
         """Pause zwischen Abgleich-Haeppchen."""
@@ -100,5 +104,9 @@ class Service(xbmc.Monitor):
                     util.warn('sync tick failed: %s' % exc)
                 if self.waitForAbort(1):
                     break
+        try:
+            self.store.save_if_dirty()
+        except OSError as exc:
+            util.warn('queue not saved: %s' % exc)
         sampler.join(5)
         util.log('service stopped')

@@ -51,6 +51,10 @@ class PairingDialog(xbmcgui.WindowDialog):
             self.addControl(c)
         self.text.setText(util.lang(32010))
         self.code.setLabel(util.lang(32024))
+
+    def show(self):
+        xbmcgui.WindowDialog.show(self)
+        # manche Kodi-Versionen setzen den Fokus erst nach show() (Fernbedienung)
         self.setFocus(self.cancel)
 
     def set_code(self, res):
@@ -116,17 +120,22 @@ def _error_dialog(exc):
 def run(store):
     """Zeigt den Kopplungsdialog. True, wenn gekoppelt."""
     api = Api(util.api_base(), util.user_agent())
+    monitor = xbmc.Monitor()
+    # Dialog sofort zeigen ("Code wird angefordert..."), nicht erst nach der Anfrage
+    dlg = PairingDialog()
+    dlg.show()
     try:
         res = _start(api)
     except ApiError as exc:
         util.warn('pair/start failed: %s' % exc.status)
+        dlg.close_dialog()
+        del dlg
         _error_dialog(exc)
         return False
-
-    monitor = xbmc.Monitor()
-    dlg = PairingDialog()
+    if dlg.closed:
+        del dlg
+        return False
     dlg.set_code(res)
-    dlg.show()
     result = None
     try:
         expires = time.time() + int(res.get('expiresIn') or 600)

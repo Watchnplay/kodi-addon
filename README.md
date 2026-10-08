@@ -23,7 +23,15 @@ Until then, download the zip from [api.watch-n-play.com/kodi](https://api.watch-
 
 ## Privacy
 
-The add-on only sends what WatchNPlay needs to match your titles: for movies and episodes in your Kodi library and for finished streaming playback the title, year, season and episode number, TMDB/IMDb/TVDB ids, watched state and the time you watched, plus the id of the streaming add-on (for example plugin.video.netflix). When pairing it sends the device name, platform, Kodi version and add-on version so you can tell your devices apart. File paths and stream addresses never leave your device. The device token is stored in Kodi's add-on data folder and never written to the log. Disconnecting in the add-on or in WatchNPlay removes the device.
+What the add-on sends to WatchNPlay:
+
+- **Your Kodi library, as a list of titles.** For each movie and episode: title, year, season and episode number, TMDB/IMDb/TVDB ids, watched state, last watched time and Kodi's internal id of the item. Without back-sync only watched titles are sent. With back-sync switched on, the whole library is sent (watched and unwatched), because WatchNPlay needs it to mark titles in Kodi, including titles you add later. The list is compared again every 6 hours and after each library scan.
+- **Finished playback from video add-ons:** the same title information, the watched percentage, the time and the id of the add-on (for example plugin.video.netflix).
+- **When pairing:** the device name Kodi reports (often the name you gave the device), the platform, the Kodi version and the add-on version, so you can tell your devices apart in WatchNPlay.
+
+File paths, stream addresses and anything else on your device never leave it. The device token is stored in Kodi's add-on data folder and never written to the log.
+
+Disconnecting in the add-on or in WatchNPlay removes the device and the data stored for it. Please disconnect before uninstalling the add-on: Kodi keeps the add-on data folder (with the token) after an uninstall.
 
 ## Development
 

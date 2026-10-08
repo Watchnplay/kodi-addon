@@ -18,8 +18,16 @@ SHOW_PROPS = ['title', 'year', 'uniqueid', 'imdbnumber']
 EPISODE_PROPS = ['tvshowid', 'title', 'season', 'episode', 'playcount', 'lastplayed', 'uniqueid']
 
 
+# JSON-RPC "Invalid params": so meldet Kodi eine Film-/Folgen-Id, die es nicht (mehr) gibt
+RPC_INVALID_PARAMS = -32602
+# Seriendaten beim Nachlesen einzelner Folgen kurz merken (ganze Staffel markiert)
+SHOW_CACHE_TTL = 60
+
+
 class RpcError(Exception):
-    pass
+    def __init__(self, message, code=None):
+        Exception.__init__(self, message)
+        self.code = code
 
 
 def rpc(method, params=None):
@@ -29,7 +37,9 @@ def rpc(method, params=None):
     raw = xbmc.executeJSONRPC(json.dumps(payload))
     data = json.loads(raw or '{}')
     if 'error' in data:
-        raise RpcError('%s: %s' % (method, data['error']))
+        err = data['error']
+        code = err.get('code') if isinstance(err, dict) else None
+        raise RpcError('%s: %s' % (method, err), code)
     return data.get('result') or {}
 
 
@@ -213,8 +223,28 @@ def collect_all():
     return items
 
 
+_show_cache = {}
+
+
+def _show(tvshowid):
+    now = time.time()
+    hit = _show_cache.get(tvshowid)
+    if hit and hit[0] > now:
+        return hit[1]
+    s = rpc('VideoLibrary.GetTVShowDetails',
+            {'tvshowid': tvshowid, 'properties': SHOW_PROPS}).get('tvshowdetails')
+    show = build_show(s) if s else None
+    if len(_show_cache) > 200:
+        _show_cache.clear()
+    _show_cache[tvshowid] = (now + SHOW_CACHE_TTL, show)
+    return show
+
+
 def get_item(kid):
-    """Aktueller Stand eines einzelnen Eintrags, None wenn nicht (mehr) vorhanden."""
+    """Aktueller Stand eines einzelnen Eintrags, None wenn nicht (mehr) vorhanden.
+
+    Ein anderer Lesefehler (Datenbank waehrend eines Scans beschaeftigt, MySQL weg) geht als
+    RpcError weiter: die Aenderung soll spaeter erneut versucht werden, nicht verloren gehen."""
     kind, dbid = parse_kid(kid)
     try:
         if kind == 'movie':
@@ -226,13 +256,14 @@ def get_item(kid):
                 return None
             shows = {}
             if e.get('tvshowid'):
-                s = rpc('VideoLibrary.GetTVShowDetails',
-                        {'tvshowid': e['tvshowid'], 'properties': SHOW_PROPS}).get('tvshowdetails')
-                if s:
-                    shows[e['tvshowid']] = build_show(s)
+                show = _show(e['tvshowid'])
+                if show:
+                    shows[e['tvshowid']] = show
             return build_episode_item(e, shows)
-    except RpcError:
-        return None
+    except RpcError as exc:
+        if exc.code == RPC_INVALID_PARAMS:
+            return None
+        raise
     return None
 
 

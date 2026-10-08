@@ -7,11 +7,18 @@ import socket
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 
-TIMEOUT = 20
+# Kurz halten: Kodi wartet beim Beenden nur wenige Sekunden auf den Dienst
+TIMEOUT = 10
+# Abgleich von bis zu 500 Titeln braucht auf dem Server laenger
+LIBRARY_TIMEOUT = 20
+# Kopplungsdialog: blockiert waehrenddessen die Fernbedienung
+POLL_TIMEOUT = 6
+# Nur das verwirft einen Stapel: der Server hat genau diesen Inhalt abgelehnt
+DROP_CODES = ('KODI_BAD_ITEMS', 'KODI_BAD_PLAYS')
 
 
 class ApiError(Exception):
-    """Nicht wiederholbarer Fehler (z. B. 400): Daten verwerfen statt endlos zu senden."""
+    """Nicht wiederholbarer Fehler (400 mit KODI_BAD_*): Daten verwerfen statt endlos zu senden."""
 
     def __init__(self, status, body=None):
         Exception.__init__(self, 'HTTP %s' % status)
@@ -30,7 +37,9 @@ class ProRequired(ApiError):
 
 
 class Retryable(ApiError):
-    """409/429/5xx/Netz: spaeter erneut versuchen, Warteschlange behalten.
+    """Alles andere (408/409/429/5xx/Netz, aber auch unerwartete 4xx wie 403 von einer
+    Firewall oder 404 bei einem Server-Rollback): spaeter erneut versuchen, Warteschlange
+    behalten. Verworfen wird nur, was der Server inhaltlich ablehnt (DROP_CODES).
 
     Dazu 503 KODI_DISABLED: Betreiber-Schalter fuer dieses Konto aus, nur warten.
     """
@@ -45,9 +54,9 @@ def classify(status, body):
         return Unauthorized(status, body)
     if status == 402:
         return ProRequired(status, body)
-    if status in (408, 409, 429) or status >= 500 or status == 0:
-        return Retryable(status, body)
-    return ApiError(status, body)
+    if status == 400 and (body or {}).get('code') in DROP_CODES:
+        return ApiError(status, body)
+    return Retryable(status, body)
 
 
 class Api(object):
@@ -57,7 +66,7 @@ class Api(object):
         self.token = token
         self._open = opener or urlrequest.urlopen
 
-    def _request(self, method, path, body=None, auth=True):
+    def _request(self, method, path, body=None, auth=True, timeout=TIMEOUT):
         headers = {
             'User-Agent': self.user_agent,
             'Accept': 'application/json',
@@ -72,7 +81,7 @@ class Api(object):
             headers['Authorization'] = 'Bearer %s' % self.token
         req = urlrequest.Request(self.base + path, data=data, headers=headers, method=method)
         try:
-            resp = self._open(req, timeout=TIMEOUT)
+            resp = self._open(req, timeout=timeout)
             try:
                 status = resp.getcode()
                 raw = resp.read()
@@ -106,7 +115,8 @@ class Api(object):
         }, auth=False)
 
     def pair_poll(self, poll_token):
-        return self._request('POST', '/pair/poll', {'pollToken': poll_token}, auth=False)
+        return self._request('POST', '/pair/poll', {'pollToken': poll_token}, auth=False,
+                             timeout=POLL_TIMEOUT)
 
     # --- Geraet ---
     def status(self):
@@ -114,7 +124,8 @@ class Api(object):
 
     def library(self, items, full):
         """Antwort: mark, unmark, backSync, version (Gesehen-Stand nach diesem Abgleich)."""
-        return self._request('POST', '/library', {'items': items, 'full': bool(full)})
+        return self._request('POST', '/library', {'items': items, 'full': bool(full)},
+                             timeout=LIBRARY_TIMEOUT)
 
     def plays(self, plays, min_percent=None):
         body = {'plays': plays}

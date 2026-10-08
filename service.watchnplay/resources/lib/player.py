@@ -170,7 +170,7 @@ class Tracker(xbmc.Player):
         # Laenge steht erst beim Ende sicher fest (should_report), Quelle und Typ schon jetzt
         ok, why = source_ok(info)
         if not ok:
-            util.log('playback not tracked: %s' % why)
+            util.debug('playback not tracked: %s' % why)
             return
         with self.lock:
             self.current = info
@@ -191,27 +191,34 @@ class Tracker(xbmc.Player):
         uid = dict(item.get('uniqueid') or {})
         try:
             tag = self.getVideoInfoTag()
+        except Exception:
+            tag = None
+        if tag is not None:
+            def read(getter, *args):
+                # einzeln: fehlt eine Methode (aeltere Kodi-Version), zaehlen die uebrigen weiter
+                try:
+                    return getattr(tag, getter)(*args)
+                except Exception:
+                    return None
             for key in ('tmdb', 'imdb', 'tvdb', 'tvshow.tmdb', 'tvshow.imdb', 'tvshow.tvdb'):
-                value = tag.getUniqueID(key)
+                value = read('getUniqueID', key)
                 if value and not uid.get(key):
                     uid[key] = value
             if not info.get('imdbnumber'):
-                info['imdbnumber'] = tag.getIMDBNumber()
+                info['imdbnumber'] = read('getIMDBNumber')
             if not info['title']:
-                info['title'] = tag.getTitle()
+                info['title'] = read('getTitle') or ''
             if not info.get('showtitle'):
-                info['showtitle'] = tag.getTVShowTitle()
+                info['showtitle'] = read('getTVShowTitle')
             if not info.get('year'):
-                info['year'] = tag.getYear()
+                info['year'] = read('getYear')
             if info.get('season') in (None, -1):
-                info['season'] = tag.getSeason()
+                info['season'] = read('getSeason')
             if info.get('episode') in (None, -1):
-                info['episode'] = tag.getEpisode()
-            mt = tag.getMediaType()
+                info['episode'] = read('getEpisode')
+            mt = read('getMediaType')
             if mt in ('movie', 'episode') and info.get('type') not in ('movie', 'episode'):
                 info['type'] = mt
-        except Exception:
-            pass
         info['uniqueid'] = uid
         # Pfad des Eintrags (plugin://...) hat Vorrang vor der aufgeloesten Stream-Adresse
         if not is_plugin_path(info.get('file')):
@@ -261,12 +268,12 @@ class Tracker(xbmc.Player):
             return
         ok, why = should_report(info, total)
         if not ok:
-            util.log('streaming playback not reported: %s' % why)
+            util.debug('streaming playback not reported: %s' % why)
             return
         pct = percent(position, total)
         threshold = util.watched_threshold()
         if not reached(pct, threshold):
-            util.log('streaming playback stopped at %.0f%% (< %.0f%%), not reported' % (pct, threshold))
+            util.debug('streaming playback stopped at %.0f%% (< %.0f%%), not reported' % (pct, threshold))
             return
         play = build_play(info, util.now_ms(), pct)
         if play:
