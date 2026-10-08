@@ -47,7 +47,7 @@
         <language></language>
         <platform>all</platform>
         <license>MIT</license>
-        <website>https://www.watch-n-play.com/kodi</website>
+        <website>https://www.watch-n-play.com</website>
         <source>https://github.com/Watchnplay/kodi-addon</source>
         <news>v0.1.3 (2026-10-08)
 - The Cancel button in the connect dialog now reacts to remote, mouse and touch (before, only Back closed it)
