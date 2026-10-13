@@ -17,9 +17,7 @@ Syncing requires WatchNPlay Pro. Not affiliated with the Kodi project or any str
 
 ## Install
 
-Once the add-on is in the official Kodi repository: *Add-ons › Install from repository › Kodi Add-on repository › Services › WatchNPlay*.
-
-Until then, download the zip from [api.watch-n-play.com/kodi](https://api.watch-n-play.com/kodi/) and use *Add-ons › Install from zip file* (allow unknown sources first).
+In Kodi: *Add-ons › Install from repository › Kodi Add-on repository › Services › WatchNPlay*. Updates arrive through Kodi automatically.
 
 ## Privacy
 
