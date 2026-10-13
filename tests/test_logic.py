@@ -1324,13 +1324,94 @@ class SecondReviewTests(unittest.TestCase):
         self.assertEqual(info['type'], 'movie')
 
 
+class DisconnectUiTests(unittest.TestCase):
+    """Betreiber 13.10.2026 (Shield): Trennen wirkte nicht, Anzeige blieb auf 'verbunden'."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        import xbmc
+        self.builtins = []
+        self._exec = xbmc.executebuiltin
+        xbmc.executebuiltin = self.builtins.append
+        self._profile = util.profile_dir
+        util.profile_dir = lambda: self.tmp
+
+    def tearDown(self):
+        import xbmc
+        xbmc.executebuiltin = self._exec
+        util.profile_dir = self._profile
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_confirm_defaults_to_yes_and_survives_old_kodi(self):
+        import xbmcgui
+        from resources.lib import script
+        calls = []
+
+        class New(object):
+            def yesno(self, heading, message, defaultbutton=None):
+                calls.append(defaultbutton)
+                return True
+
+        class Old(object):
+            def yesno(self, heading, message):
+                calls.append('old')
+                return True
+
+        orig = xbmcgui.Dialog
+        xbmcgui.DLG_YESNO_YES_BTN = 11
+        try:
+            xbmcgui.Dialog = New
+            self.assertTrue(script._confirm('x'))
+            xbmcgui.Dialog = Old
+            self.assertTrue(script._confirm('x'))
+        finally:
+            xbmcgui.Dialog = orig
+        self.assertEqual(calls, [11, 'old'])
+
+    def test_disconnect_without_token_fixes_the_display(self):
+        import xbmcaddon
+        from resources.lib import script
+        util.set_status(True, 'Jens', 'TV')
+        self.assertIn(xbmcaddon.Addon.settings.get('paired'), (True, 'true'))
+        script.main(['default.py', 'disconnect'])
+        self.assertIn(xbmcaddon.Addon.settings.get('paired'), (False, 'false'))
+        self.assertTrue(any('OpenSettings' in b for b in self.builtins))
+
+    def test_disconnect_survives_a_failing_file_step(self):
+        from resources.lib import script
+        st = store_mod.Store(self.tmp)
+        st.set_auth('tok', 'Jens', True)
+        util.set_status(True, 'Jens', 'TV')
+
+        def boom():
+            raise OSError('busy')
+        st.clear_queue = boom
+        orig = script.Api
+
+        class NoNet(object):
+            def __init__(self, *a, **k):
+                pass
+
+            def unpair(self):
+                return {}
+
+        script.Api = NoNet
+        try:
+            self.assertTrue(script.disconnect(st, confirm=False))
+        finally:
+            script.Api = orig
+        import xbmcaddon
+        self.assertIn(xbmcaddon.Addon.settings.get('paired'), (False, 'false'))
+        self.assertIsNone(store_mod.Store(self.tmp).token)
+
+
 class MetadataTests(unittest.TestCase):
     """Fix 9/10: Pro immer noetig, schwedisch einheitlich 'Koppla', keine Gedankenstriche."""
 
     def test_disclaimer_and_version(self):
         import xml.etree.ElementTree as ET
         root = ET.parse(os.path.join(ADDON_DIR, 'addon.xml')).getroot()
-        self.assertEqual(root.get('version'), '0.1.5')
+        self.assertEqual(root.get('version'), '0.1.6')
         meta = root.find("./extension[@point='xbmc.addon.metadata']")
         disclaimers = dict((d.get('lang'), d.text) for d in meta.findall('disclaimer'))
         self.assertEqual(len(disclaimers), 12)
@@ -1339,7 +1420,7 @@ class MetadataTests(unittest.TestCase):
         for word in ('may require', 'kann WatchNPlay', 'peut', 'puede', 'può', 'kan WatchNPlay',
                      'może', 'pode', 'kan kräva', 'kan kreve', 'kan kræve'):
             self.assertFalse(any(word in t for t in disclaimers.values()), word)
-        self.assertIn('v0.1.5', meta.find('news').text)
+        self.assertIn('v0.1.6', meta.find('news').text)
 
     def test_swedish_uses_koppla(self):
         path = os.path.join(ADDON_DIR, 'resources', 'language', 'resource.language.sv_se', 'strings.po')
