@@ -150,6 +150,7 @@ class FakeApi(object):
         self.calls = []
         self.counts = {}
         self.min_percents = []
+        self.lasts = []
 
     def _maybe(self, name):
         self.calls.append(name)
@@ -165,9 +166,10 @@ class FakeApi(object):
         self._maybe('status')
         return dict(self.status_res)
 
-    def library(self, items, full):
+    def library(self, items, full, last=None):
         self._maybe('library')
         self.calls.append(('library', len(items), full))
+        self.lasts.append(last)
         return dict(self.library_res)
 
     def plays(self, plays, min_percent=None):
@@ -363,18 +365,19 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(ui.notes, [32018])
         self.assertEqual(api.calls.count('status'), 1)
 
-    def test_402_pauses_notifies_daily_and_retries_every_6h(self):
+    def test_402_pauses_notifies_daily_and_retries_every_quarter_hour(self):
         eng, st, api, ui, lib, clock = make_engine(self.tmp)
         api.raise_on['status'] = ProRequired(402, {'code': 'PRO_REQUIRED'})
         eng.tick()
         self.assertTrue(eng.pro_paused)
         self.assertEqual(ui.notes, [32019])
         # waehrend der Pause keine Anfragen
-        clock.t += 3600
+        clock.t += sync.PRO_RETRY - 60
         eng.tick()
         self.assertEqual(api.calls.count('status'), 1)
-        # nach 6 h erneut, weiter 402: kein zweiter Hinweis am selben Tag
-        clock.t += 5 * 3600 + 1
+        # nach der Wartezeit erneut, weiter 402: kein zweiter Hinweis am selben Tag
+        self.assertEqual(sync.PRO_RETRY, 15 * 60)
+        clock.t += 61
         st.state['proNotifiedDay'] = util.time.strftime('%Y-%m-%d', util.time.localtime(clock.t))
         eng.tick()
         self.assertEqual(api.calls.count('status'), 2)
@@ -1147,8 +1150,8 @@ class SecondReviewTests(unittest.TestCase):
         versions = iter(['v1', 'v2', 'v3'])
         orig = api.library
 
-        def library(items, full):
-            res = orig(items, full)
+        def library(items, full, last=None):
+            res = orig(items, full, last)
             res['version'] = next(versions)
             return res
         api.library = library
@@ -1405,13 +1408,167 @@ class DisconnectUiTests(unittest.TestCase):
         self.assertIsNone(store_mod.Store(self.tmp).token)
 
 
+class AppSyncRequestTests(unittest.TestCase):
+    """'Jetzt synchronisieren' aus der App (13.10.2026): Wunsch kommt ueber /status."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def full_calls(self, api):
+        return [c for c in api.calls if isinstance(c, tuple) and c[2]]
+
+    def test_request_triggers_one_full_even_during_playback(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(2, watched=True))
+        eng.tick()
+        n = len(self.full_calls(api))
+        eng.is_playing = lambda: True
+        api.status_res['syncRequest'] = '2026-10-13T15:00:00.000Z'
+        clock.t += sync.STATUS_EVERY
+        eng.tick()
+        self.assertEqual(len(self.full_calls(api)), n + 1)
+        # derselbe Wunsch steht noch in der Antwort (z. B. zweites Geraet): nicht erneut
+        clock.t += sync.STATUS_EVERY
+        eng.tick()
+        self.assertEqual(len(self.full_calls(api)), n + 1)
+        # neuer Wunsch: wieder
+        api.status_res['syncRequest'] = '2026-10-13T15:10:00.000Z'
+        clock.t += sync.STATUS_EVERY
+        eng.tick()
+        self.assertEqual(len(self.full_calls(api)), n + 2)
+
+    def test_status_is_polled_every_minute(self):
+        self.assertEqual(sync.STATUS_EVERY, 60)
+
+    def test_only_the_last_part_of_a_full_pass_is_flagged(self):
+        # Der Server haelt den Wunsch erst mit dem letzten Haeppchen fuer erfuellt
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(1201, watched=True))
+        eng.tick()
+        self.assertEqual(api.lasts, [False, False, True])
+
+    def test_empty_library_still_reports_a_finished_pass(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, [])
+        eng.tick()
+        self.assertEqual(api.lasts, [True])
+
+    def test_request_restarts_an_interrupted_pass_from_the_first_part(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(1201, watched=True))
+        api.raise_at['library'] = (2, Retryable(429, {}))
+        eng.tick()
+        self.assertEqual(st.state['fullPass']['next'], 1)
+        del api.calls[:]
+        del api.lasts[:]
+        api.raise_at.clear()
+        api.status_res['syncRequest'] = '2026-10-13T15:00:00.000Z'
+        clock.t += sync.STATUS_EVERY
+        eng.tick()
+        # alle drei Haeppchen, nicht nur die zwei restlichen
+        self.assertEqual(api.lasts, [False, False, True])
+
+    def test_single_changes_carry_no_last_flag(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(2, watched=True))
+        eng.tick()
+        del api.lasts[:]
+        eng.on_library_update('movie:1', 0)
+        clock.t += sync.DEBOUNCE + 1
+        eng.tick()
+        self.assertEqual(api.lasts, [None])
+
+
+class AccountSwitchTests(unittest.TestCase):
+    """Review 13.10.2026: dasselbe Kodi nacheinander an zwei Konten."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def full_calls(self, api):
+        return [c for c in api.calls if isinstance(c, tuple) and c[2]]
+
+    def test_second_account_gets_everything_and_nothing_of_the_first(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(3, watched=True))
+        api.status_res['syncRequest'] = '2026-10-13T15:00:00.000Z'
+        eng.tick()
+        self.assertEqual(st.state.get('syncHandled'), '2026-10-13T15:00:00.000Z')
+        # offene Meldungen des ersten Kontos
+        eng.on_library_update('movie:1', 0)
+        eng.queue_play({'kind': 'movie', 'title': 'X', 'tmdbId': 999999, 'percent': 95, 'watchedAt': 1})
+        self.assertTrue(st.deltas)
+        self.assertTrue(st.plays)
+        # in Kodi getrennt, dann mit dem zweiten Konto gekoppelt
+        st.clear_auth()
+        eng.on_unpaired()
+        self.assertEqual(st.state, {})
+        self.assertFalse(st.deltas)
+        self.assertFalse(st.plays)
+        tokens = []
+        eng.make_api = lambda token: tokens.append(token) or api
+        del api.calls[:]
+        st.set_auth('token-b', 'Bea', False)
+        eng.on_paired()
+        api.status_res = {'userName': 'Bea', 'deviceName': 'TV', 'pro': True, 'backSync': False, 'version': 'b1'}
+        eng.tick()
+        self.assertEqual(set(tokens), {'token-b'})
+        # voller Abgleich mit allen drei gesehenen Titeln, keine Wiedergabe des ersten Kontos
+        self.assertEqual(self.full_calls(api), [('library', 3, True)])
+        self.assertNotIn('plays', api.calls)
+        self.assertEqual(st.state.get('userName'), 'Bea')
+        self.assertEqual(st.state.get('version'), 'b1')
+        self.assertIsNone(st.state.get('syncHandled'))
+
+    def test_removed_in_app_then_paired_again_starts_clean(self):
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(2, watched=True))
+        eng.tick()
+        # in der App entfernt: naechste Nachfrage bekommt 401
+        exc = Unauthorized(401, {'code': 'KODI_UNPAIRED'})
+        exc.token = 'secret-token'
+        api.raise_on['status'] = exc
+        clock.t += sync.STATUS_EVERY
+        eng.tick()
+        self.assertFalse(eng.paired)
+        self.assertEqual(ui.states[-1][0], False)
+        # danach sendet der Dienst nichts mehr
+        del api.calls[:]
+        eng.on_library_update('movie:1', 0)
+        clock.t += 600
+        eng.tick()
+        self.assertEqual(api.calls, [])
+        # neu gekoppelt: wieder ein voller Abgleich
+        api.raise_on.clear()
+        st.set_auth('token-c', 'Jens', False)
+        eng.on_paired()
+        eng.tick()
+        self.assertEqual(len(self.full_calls(api)), 1)
+
+    def test_token_changed_without_notice_resets_the_session(self):
+        # Meldung des Skripts an den Dienst ging verloren: der Dienst merkt den
+        # Wechsel am Token selbst und nimmt nichts vom alten Konto mit
+        eng, st, api, ui, lib, clock = make_engine(self.tmp, movies(2, watched=True))
+        eng.tick()
+        eng.on_library_update('movie:1', 0)
+        eng.queue_play({'kind': 'movie', 'title': 'X', 'tmdbId': 999999, 'percent': 95, 'watchedAt': 1})
+        st.state['syncHandled'] = 'alt'
+        del api.calls[:]
+        st.set_auth('token-b', 'Bea', False)
+        clock.t += 1
+        eng.tick()
+        self.assertFalse(st.plays)
+        self.assertIsNone(st.state.get('syncHandled'))
+        self.assertEqual(self.full_calls(api), [('library', 2, True)])
+        self.assertNotIn('plays', api.calls)
+
+
 class MetadataTests(unittest.TestCase):
     """Fix 9/10: Pro immer noetig, schwedisch einheitlich 'Koppla', keine Gedankenstriche."""
 
     def test_disclaimer_and_version(self):
         import xml.etree.ElementTree as ET
         root = ET.parse(os.path.join(ADDON_DIR, 'addon.xml')).getroot()
-        self.assertEqual(root.get('version'), '0.1.6')
+        self.assertEqual(root.get('version'), '0.1.8')
         meta = root.find("./extension[@point='xbmc.addon.metadata']")
         disclaimers = dict((d.get('lang'), d.text) for d in meta.findall('disclaimer'))
         self.assertEqual(len(disclaimers), 12)
@@ -1420,7 +1577,7 @@ class MetadataTests(unittest.TestCase):
         for word in ('may require', 'kann WatchNPlay', 'peut', 'puede', 'può', 'kan WatchNPlay',
                      'może', 'pode', 'kan kräva', 'kan kreve', 'kan kræve'):
             self.assertFalse(any(word in t for t in disclaimers.values()), word)
-        self.assertIn('v0.1.6', meta.find('news').text)
+        self.assertIn('v0.1.8', meta.find('news').text)
 
     def test_swedish_uses_koppla(self):
         path = os.path.join(ADDON_DIR, 'resources', 'language', 'resource.language.sv_se', 'strings.po')
